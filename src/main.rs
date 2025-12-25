@@ -4,30 +4,16 @@
 //! supporting JWT/Bearer tokens, API keys, and Basic auth.
 
 use anyhow::{anyhow, Context, Result};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use chrono::{Duration, Utc};
 use clap::Parser;
 use jsonwebtoken::{decode, DecodingKey, TokenData, Validation, Algorithm};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::net::UnixListener;
-use tokio::sync::RwLock;
-use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use sentinel_agent_protocol::{
-    AgentHandler, AgentResult, AgentServer, Decision, Mutations,
+    AgentHandler, AgentResponse, AgentServer, AuditMetadata, HeaderOp,
     RequestHeadersEvent, ResponseHeadersEvent,
 };
 
@@ -145,7 +131,6 @@ pub struct BasicAuthUser {
 }
 
 /// Authentication agent configuration
-#[derive(Debug, Clone)]
 pub struct AuthConfig {
     pub jwt_secret: Option<Vec<u8>>,
     pub jwt_public_key: Option<DecodingKey>,
@@ -161,7 +146,7 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn from_args(args: &Args) -> Result<Self> {
+    fn from_args(args: &Args) -> Result<Self> {
         // Parse JWT algorithm
         let jwt_algorithm = match args.jwt_algorithm.to_uppercase().as_str() {
             "HS256" => Algorithm::HS256,
@@ -248,15 +233,20 @@ impl AuthAgent {
     }
 
     /// Authenticate a request
-    pub fn authenticate(&self, headers: &[(String, String)]) -> Result<Identity> {
-        // Convert headers to HashMap for easier lookup
-        let header_map: HashMap<&str, &str> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+    pub fn authenticate(&self, headers: &HashMap<String, Vec<String>>) -> Result<Identity> {
+        // Helper to get first header value (case-insensitive)
+        let get_header = |name: &str| -> Option<&str> {
+            let name_lower = name.to_lowercase();
+            for (key, values) in headers {
+                if key.to_lowercase() == name_lower {
+                    return values.first().map(|s| s.as_str());
+                }
+            }
+            None
+        };
 
         // 1. Try JWT Bearer token
-        if let Some(auth_header) = header_map.get("authorization").or(header_map.get("Authorization")) {
+        if let Some(auth_header) = get_header("authorization") {
             if auth_header.starts_with("Bearer ") || auth_header.starts_with("bearer ") {
                 let token = &auth_header[7..];
                 if let Ok(identity) = self.validate_jwt(token) {
@@ -274,12 +264,9 @@ impl AuthAgent {
         }
 
         // 3. Try API key
-        let api_key_header_lower = self.config.api_key_header.to_lowercase();
-        for (key, value) in headers {
-            if key.to_lowercase() == api_key_header_lower {
-                if let Ok(identity) = self.validate_api_key(value) {
-                    return Ok(identity);
-                }
+        if let Some(api_key) = get_header(&self.config.api_key_header) {
+            if let Ok(identity) = self.validate_api_key(api_key) {
+                return Ok(identity);
             }
         }
 
@@ -298,16 +285,18 @@ impl AuthAgent {
 
         let mut validation = Validation::new(self.config.jwt_algorithm);
 
+        // Set issuer validation
         if let Some(ref issuer) = self.config.jwt_issuer {
             validation.set_issuer(&[issuer]);
         } else {
-            validation.validate_iss = false;
+            validation.iss = None;
         }
 
+        // Set audience validation
         if let Some(ref audience) = self.config.jwt_audience {
             validation.set_audience(&[audience]);
         } else {
-            validation.validate_aud = false;
+            validation.aud = None;
         }
 
         let token_data: TokenData<JwtClaims> = decode(token, &decoding_key, &validation)
@@ -381,13 +370,8 @@ impl AuthAgent {
 
 #[async_trait::async_trait]
 impl AgentHandler for AuthAgent {
-    async fn on_request_headers(
-        &self,
-        event: RequestHeadersEvent,
-    ) -> AgentResult<(Decision, Mutations)> {
-        let headers: Vec<(String, String)> = event.headers.clone();
-
-        match self.authenticate(&headers) {
+    async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
+        match self.authenticate(&event.headers) {
             Ok(identity) => {
                 info!(
                     user_id = %identity.id,
@@ -395,51 +379,60 @@ impl AgentHandler for AuthAgent {
                     "Authentication successful"
                 );
 
-                let mut mutations = Mutations::default();
-                mutations.request_headers.push((
-                    self.config.user_id_header.clone(),
-                    identity.id.clone(),
-                ));
-                mutations.request_headers.push((
-                    self.config.auth_method_header.clone(),
-                    identity.method.to_string(),
-                ));
+                let mut response = AgentResponse::default_allow()
+                    .add_request_header(HeaderOp::Set {
+                        name: self.config.user_id_header.clone(),
+                        value: identity.id.clone(),
+                    })
+                    .add_request_header(HeaderOp::Set {
+                        name: self.config.auth_method_header.clone(),
+                        value: identity.method.to_string(),
+                    });
 
                 // Add claims as headers
                 for (key, value) in &identity.claims {
                     if let serde_json::Value::String(s) = value {
-                        mutations.request_headers.push((
-                            format!("X-Auth-Claim-{}", key),
-                            s.clone(),
-                        ));
+                        response = response.add_request_header(HeaderOp::Set {
+                            name: format!("X-Auth-Claim-{}", key),
+                            value: s.clone(),
+                        });
                     }
                 }
 
-                Ok((Decision::Allow, mutations))
+                response.with_audit(AuditMetadata {
+                    tags: vec!["auth".to_string(), identity.method.to_string()],
+                    ..Default::default()
+                })
             }
             Err(e) => {
                 debug!("Authentication failed: {}", e);
 
                 if self.config.fail_open {
                     warn!("Authentication failed but fail_open is enabled, allowing request");
-                    Ok((Decision::Allow, Mutations::default()))
+                    AgentResponse::default_allow()
+                        .with_audit(AuditMetadata {
+                            tags: vec!["auth".to_string(), "fail_open".to_string()],
+                            reason_codes: vec!["AUTH_FAILED_OPEN".to_string()],
+                            ..Default::default()
+                        })
                 } else {
-                    let mut mutations = Mutations::default();
-                    mutations.response_headers.push((
-                        "WWW-Authenticate".to_string(),
-                        "Bearer realm=\"sentinel\"".to_string(),
-                    ));
-                    Ok((Decision::Block { status_code: 401 }, mutations))
+                    AgentResponse::block(401, Some("Unauthorized".to_string()))
+                        .add_response_header(HeaderOp::Set {
+                            name: "WWW-Authenticate".to_string(),
+                            value: "Bearer realm=\"sentinel\"".to_string(),
+                        })
+                        .with_audit(AuditMetadata {
+                            tags: vec!["auth".to_string(), "blocked".to_string()],
+                            reason_codes: vec!["AUTH_REQUIRED".to_string()],
+                            ..Default::default()
+                        })
                 }
             }
         }
     }
 
-    async fn on_response_headers(
-        &self,
-        _event: ResponseHeadersEvent,
-    ) -> AgentResult<(Decision, Mutations)> {
-        Ok((Decision::Allow, Mutations::default()))
+    async fn on_response_headers(&self, _event: ResponseHeadersEvent) -> AgentResponse {
+        AgentResponse::default_allow()
     }
 }
 
@@ -471,15 +464,14 @@ async fn main() -> Result<()> {
     // Create agent
     let agent = AuthAgent::new(config);
 
-    // Remove existing socket if present
-    if args.socket.exists() {
-        std::fs::remove_file(&args.socket)?;
-    }
-
     // Start agent server
     info!(socket = ?args.socket, "Starting agent server");
-    let server = AgentServer::new(agent);
-    server.serve_unix(&args.socket).await?;
+    let server = AgentServer::new(
+        "sentinel-auth-agent",
+        args.socket,
+        Box::new(agent),
+    );
+    server.run().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
     Ok(())
 }
@@ -527,9 +519,8 @@ mod tests {
         let config = test_config();
         let agent = AuthAgent::new(config);
 
-        let headers = vec![
-            ("X-API-Key".to_string(), "test-key-123".to_string()),
-        ];
+        let mut headers = HashMap::new();
+        headers.insert("X-API-Key".to_string(), vec!["test-key-123".to_string()]);
 
         let result = agent.authenticate(&headers);
         assert!(result.is_ok());
@@ -546,9 +537,8 @@ mod tests {
 
         // Base64 encode "testuser:testpass"
         let credentials = BASE64.encode("testuser:testpass");
-        let headers = vec![
-            ("Authorization".to_string(), format!("Basic {}", credentials)),
-        ];
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), vec![format!("Basic {}", credentials)]);
 
         let result = agent.authenticate(&headers);
         assert!(result.is_ok());
@@ -563,9 +553,8 @@ mod tests {
         let config = test_config();
         let agent = AuthAgent::new(config);
 
-        let headers = vec![
-            ("X-API-Key".to_string(), "invalid-key".to_string()),
-        ];
+        let mut headers = HashMap::new();
+        headers.insert("X-API-Key".to_string(), vec!["invalid-key".to_string()]);
 
         let result = agent.authenticate(&headers);
         assert!(result.is_err());
@@ -576,9 +565,8 @@ mod tests {
         let config = test_config();
         let agent = AuthAgent::new(config);
 
-        let headers = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_string(), vec!["application/json".to_string()]);
 
         let result = agent.authenticate(&headers);
         assert!(result.is_err());
