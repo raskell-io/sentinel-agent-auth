@@ -55,7 +55,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxmlsec1-dev libxml2-dev
+          sudo apt-get install -y libxmlsec1-dev libxml2-dev protobuf-compiler
 
       - name: Build release binary
         run: |
