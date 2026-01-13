@@ -76,4 +76,4 @@ ENV RUST_LOG=info,sentinel_auth_agent=debug \
 
 USER nonroot:nonroot
 
-CMD ["/sentinel-auth-agent"]
+ENTRYPOINT ["/sentinel-auth-agent"]
