@@ -1,6 +1,6 @@
 [package]
 name = "sentinel-agent-auth"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Sentinel Contributors"]
@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Sentinel protocol
-sentinel-agent-protocol = "0.2"
+sentinel-agent-protocol = "0.3"
 sentinel-common = "0.1"
 
 # Async runtime

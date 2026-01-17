@@ -22,9 +22,15 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use sentinel_agent_protocol::{
-    AgentHandler, AgentResponse, AgentServer, AuditMetadata, ConfigureEvent, HeaderOp,
+    AgentResponse, AuditMetadata, HeaderOp,
     RequestBodyChunkEvent, RequestHeadersEvent, ResponseHeadersEvent,
 };
+use sentinel_agent_protocol::v2::{
+    AgentCapabilities, AgentFeatures, AgentHandlerV2, CounterMetric, DrainReason,
+    GrpcAgentServerV2, HealthStatus, MetricsReport, ShutdownReason,
+};
+use sentinel_agent_protocol::EventType;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use authz::{AuthzConfig, AuthzConfigJson, CedarAuthorizer};
@@ -42,9 +48,14 @@ use session::{spawn_cleanup_task, SessionId, SessionStore, DEFAULT_CLEANUP_INTER
 #[command(name = "sentinel-auth-agent")]
 #[command(about = "Authentication agent for Sentinel reverse proxy")]
 struct Args {
-    /// Path to Unix socket
+    /// Path to Unix socket (for UDS transport)
     #[arg(long, default_value = "/tmp/sentinel-auth.sock", env = "AGENT_SOCKET")]
     socket: PathBuf,
+
+    /// gRPC server address (e.g., "[::1]:50051" or "0.0.0.0:50051")
+    /// If specified, the agent will use gRPC transport instead of UDS
+    #[arg(long, env = "GRPC_ADDRESS")]
+    grpc_address: Option<String>,
 
     /// JWT secret key (for HS256)
     #[arg(long, env = "JWT_SECRET")]
@@ -317,6 +328,16 @@ pub struct AuthAgent {
     exchange_config: RwLock<TokenExchangeConfig>,
     /// Token issuer (initialized when exchange is enabled).
     token_issuer: RwLock<Option<TokenIssuer>>,
+    /// Metrics: total requests processed.
+    requests_total: AtomicU64,
+    /// Metrics: successful authentications.
+    auth_success_total: AtomicU64,
+    /// Metrics: failed authentications.
+    auth_failure_total: AtomicU64,
+    /// Metrics: blocked requests (authorization denied).
+    blocked_total: AtomicU64,
+    /// Health state: true if healthy.
+    is_healthy: RwLock<bool>,
 }
 
 impl AuthAgent {
@@ -334,6 +355,11 @@ impl AuthAgent {
             authorizer: RwLock::new(None),
             exchange_config: RwLock::new(TokenExchangeConfig::default()),
             token_issuer: RwLock::new(None),
+            requests_total: AtomicU64::new(0),
+            auth_success_total: AtomicU64::new(0),
+            auth_failure_total: AtomicU64::new(0),
+            blocked_total: AtomicU64::new(0),
+            is_healthy: RwLock::new(true),
         }
     }
 
@@ -1167,13 +1193,79 @@ impl SubjectTokenValidator for AuthAgentTokenValidator<'_> {
 }
 
 #[async_trait::async_trait]
-impl AgentHandler for AuthAgent {
-    async fn on_configure(&self, event: ConfigureEvent) -> AgentResponse {
-        let json_config: AuthConfigJson = match serde_json::from_value(event.config) {
+impl AgentHandlerV2 for AuthAgent {
+    /// Get agent capabilities for v2 protocol.
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::new(
+            "sentinel-auth-agent",
+            "Sentinel Auth Agent",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_event(EventType::RequestHeaders)
+        .with_event(EventType::RequestBodyChunk)
+        .with_event(EventType::ResponseHeaders)
+        .with_event(EventType::Configure)
+        .with_features(AgentFeatures {
+            streaming_body: true,
+            websocket: false,
+            guardrails: false,
+            config_push: true,
+            metrics_export: true,
+            concurrent_requests: 100,
+            cancellation: true,
+            flow_control: false,
+            health_reporting: true,
+        })
+    }
+
+    /// Get current health status.
+    fn health_status(&self) -> HealthStatus {
+        let is_healthy = self.is_healthy.read()
+            .map(|guard| *guard)
+            .unwrap_or(false);
+
+        if is_healthy {
+            HealthStatus::healthy("sentinel-auth-agent")
+        } else {
+            HealthStatus::degraded(
+                "sentinel-auth-agent",
+                vec!["config_error".to_string()],
+                1.5, // Increase timeout multiplier when degraded
+            )
+        }
+    }
+
+    /// Get current metrics report.
+    fn metrics_report(&self) -> Option<MetricsReport> {
+        let mut report = MetricsReport::new("sentinel-auth-agent", 10_000);
+
+        report.counters.push(CounterMetric::new(
+            "auth_requests_total",
+            self.requests_total.load(Ordering::Relaxed),
+        ));
+        report.counters.push(CounterMetric::new(
+            "auth_success_total",
+            self.auth_success_total.load(Ordering::Relaxed),
+        ));
+        report.counters.push(CounterMetric::new(
+            "auth_failure_total",
+            self.auth_failure_total.load(Ordering::Relaxed),
+        ));
+        report.counters.push(CounterMetric::new(
+            "auth_blocked_total",
+            self.blocked_total.load(Ordering::Relaxed),
+        ));
+
+        Some(report)
+    }
+
+    /// Handle configuration update (v2 signature).
+    async fn on_configure(&self, config: serde_json::Value, _version: Option<String>) -> bool {
+        let json_config: AuthConfigJson = match serde_json::from_value(config) {
             Ok(cfg) => cfg,
             Err(e) => {
                 warn!("Failed to parse auth config: {}, using defaults", e);
-                return AgentResponse::default_allow();
+                return false;
             }
         };
 
@@ -1185,14 +1277,46 @@ impl AgentHandler for AuthAgent {
 
         if let Err(e) = self.reconfigure(json_config) {
             warn!("Failed to reconfigure auth agent: {}", e);
-            return AgentResponse::block(500, Some(format!("Configuration error: {}", e)));
+            if let Ok(mut healthy) = self.is_healthy.write() {
+                *healthy = false;
+            }
+            return false;
+        }
+
+        if let Ok(mut healthy) = self.is_healthy.write() {
+            *healthy = true;
         }
 
         info!("Auth agent configured via on_configure");
-        AgentResponse::default_allow()
+        true
+    }
+
+    /// Handle shutdown request.
+    async fn on_shutdown(&self, reason: ShutdownReason, grace_period_ms: u64) {
+        info!(
+            reason = ?reason,
+            grace_period_ms = grace_period_ms,
+            "Auth agent received shutdown request"
+        );
+        // Clean up any resources if needed
+        // Session store cleanup is handled by the cleanup task
+    }
+
+    /// Handle drain request.
+    async fn on_drain(&self, duration_ms: u64, reason: DrainReason) {
+        info!(
+            reason = ?reason,
+            duration_ms = duration_ms,
+            "Auth agent received drain request"
+        );
+        // Stop accepting new requests
+        // Existing requests will complete
     }
 
     async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
+        // Increment request counter
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+
         // Get config values we need before authentication
         let (user_id_header, auth_method_header, fail_open) = {
             let config = match self.config.read() {
@@ -1261,6 +1385,7 @@ impl AgentHandler for AuthAgent {
                 method = %identity.method,
                 "mTLS authentication successful"
             );
+            self.auth_success_total.fetch_add(1, Ordering::Relaxed);
             return self.build_identity_response(identity, &user_id_header, &auth_method_header, &request_method, request_path);
         }
 
@@ -1272,6 +1397,7 @@ impl AgentHandler for AuthAgent {
                     method = %identity.method,
                     "SAML session authentication successful"
                 );
+                self.auth_success_total.fetch_add(1, Ordering::Relaxed);
                 return self.build_saml_identity_response(&identity, &saml_config, &user_id_header, &auth_method_header);
             }
         }
@@ -1289,6 +1415,7 @@ impl AgentHandler for AuthAgent {
                         method = %identity.method,
                         "OIDC authentication successful"
                     );
+                    self.auth_success_total.fetch_add(1, Ordering::Relaxed);
                     return self.build_identity_response(identity, &user_id_header, &auth_method_header, &request_method, request_path);
                 }
             }
@@ -1302,11 +1429,13 @@ impl AgentHandler for AuthAgent {
                     method = %identity.method,
                     "Authentication successful"
                 );
+                self.auth_success_total.fetch_add(1, Ordering::Relaxed);
 
                 self.build_identity_response(identity, &user_id_header, &auth_method_header, &request_method, request_path)
             }
             Err(e) => {
                 debug!("Authentication failed: {}", e);
+                self.auth_failure_total.fetch_add(1, Ordering::Relaxed);
 
                 // If SAML is enabled and path should be protected, redirect to IdP
                 if saml_config.enabled && saml_config.should_protect_path(request_path) {
@@ -1328,6 +1457,7 @@ impl AgentHandler for AuthAgent {
                             ..Default::default()
                         })
                 } else {
+                    self.blocked_total.fetch_add(1, Ordering::Relaxed);
                     AgentResponse::block(401, Some("Unauthorized".to_string()))
                         .add_response_header(HeaderOp::Set {
                             name: "WWW-Authenticate".to_string(),
@@ -1560,14 +1690,68 @@ async fn main() -> Result<()> {
     // Create agent with session store
     let agent = AuthAgent::new(config, session_store);
 
-    // Start agent server
-    info!(socket = ?args.socket, "Starting agent server");
-    let server = AgentServer::new(
-        "sentinel-auth-agent",
-        args.socket,
-        Box::new(agent),
-    );
-    server.run().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Start agent server with appropriate transport
+    if let Some(grpc_address) = args.grpc_address {
+        // Use gRPC transport
+        let addr: std::net::SocketAddr = grpc_address
+            .parse()
+            .with_context(|| format!("Invalid gRPC address: {}", grpc_address))?;
+
+        info!(
+            address = %addr,
+            "Starting auth agent with gRPC v2 transport"
+        );
+
+        let server = GrpcAgentServerV2::new("sentinel-auth-agent", Box::new(agent));
+        server.run(addr).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    } else {
+        // Use UDS transport (v1 fallback for now, as v2 UDS server is client-side only)
+        // In a real deployment, you'd use gRPC for v2 or implement a v2 UDS server
+        info!(
+            socket = ?args.socket,
+            "Starting auth agent with UDS transport"
+        );
+
+        // For UDS, we need to use the v1 server since v2 UDS is primarily client-side
+        // The v2 protocol is fully supported over gRPC
+        use sentinel_agent_protocol::{AgentServer, AgentHandler};
+
+        // Create a v1-compatible wrapper
+        struct V1Wrapper(AuthAgent);
+
+        #[async_trait::async_trait]
+        impl AgentHandler for V1Wrapper {
+            async fn on_configure(&self, event: sentinel_agent_protocol::ConfigureEvent) -> AgentResponse {
+                // Forward to v2 handler
+                let success = self.0.on_configure(event.config, None).await;
+                if success {
+                    AgentResponse::default_allow()
+                } else {
+                    AgentResponse::block(500, Some("Configuration failed".to_string()))
+                }
+            }
+
+            async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
+                AgentHandlerV2::on_request_headers(&self.0, event).await
+            }
+
+            async fn on_request_body_chunk(&self, event: RequestBodyChunkEvent) -> AgentResponse {
+                AgentHandlerV2::on_request_body_chunk(&self.0, event).await
+            }
+
+            async fn on_response_headers(&self, event: ResponseHeadersEvent) -> AgentResponse {
+                AgentHandlerV2::on_response_headers(&self.0, event).await
+            }
+        }
+
+        let wrapped_agent = V1Wrapper(agent);
+        let server = AgentServer::new(
+            "sentinel-auth-agent",
+            args.socket,
+            Box::new(wrapped_agent),
+        );
+        server.run().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    }
 
     Ok(())
 }
