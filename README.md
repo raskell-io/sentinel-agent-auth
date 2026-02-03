@@ -13,7 +13,7 @@ Authentication and authorization agent for [Sentinel](https://github.com/raskell
 - **mTLS Client Certificates** - X.509 certificate-based authentication
 
 ### Authorization (AuthZ)
-- **Cedar Policy Engine** - Policy-as-code authorization with fine-grained access control
+- **Cedar Policy Engine** - Basic policy-as-code authorization (principal, action, resource evaluation)
 
 ### Token Services
 - **Token Exchange (RFC 8693)** - Convert between token types (SAML to JWT, external to internal JWT)
@@ -268,6 +268,7 @@ cargo test
 
 ## Security Considerations
 
+- **Prefer RS256/ES256 over HS256 for JWT** — HS256 uses a shared secret (both signer and verifier must know it). Use asymmetric algorithms (RS256, ES256) in production to avoid sharing secrets across services.
 - Always use strong, random JWT secrets (minimum 32 characters for HS256)
 - Store secrets in environment variables, not command line args
 - Use RS256/ES256 with public keys for production when possible
