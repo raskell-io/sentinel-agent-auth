@@ -2,7 +2,7 @@
 name = "zentinel-agent-auth"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 authors = ["Zentinel Contributors"]
 license = "Apache-2.0"
 repository = "https://github.com/zentinelproxy/zentinel-agent-auth"
@@ -77,7 +77,7 @@ flate2 = "1.0"
 urlencoding = "2.1"
 
 # OIDC/JWKS - HTTP client for fetching JWKS
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
 
 # Cedar Policy Engine - authorization
 cedar-policy = "4.2"
