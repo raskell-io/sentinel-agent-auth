@@ -39,11 +39,30 @@ Authentication and authorization agent for [Zentinel](https://github.com/zentine
 
 ## Installation
 
-### From crates.io
+### Using Cargo
+
+`zentinel-agent-auth` is not published on crates.io, so `cargo install
+zentinel-agent-auth` does not work. Install from the repository instead:
 
 ```bash
-cargo install zentinel-agent-auth
+cargo install --git https://github.com/zentinelproxy/zentinel-agent-auth
 ```
+
+This builds and installs the `zentinel-auth-agent` binary.
+
+### Prebuilt Binaries
+
+The [v0.2.0 release](https://github.com/zentinelproxy/zentinel-agent-auth/releases)
+attaches a single `linux-amd64` binary, still carrying the pre-rename
+`sentinel-auth-agent` name:
+
+```bash
+curl -fsSL -o zentinel-auth-agent \
+  "https://github.com/zentinelproxy/zentinel-agent-auth/releases/download/v0.2.0/sentinel-auth-agent-linux-amd64"
+sudo install -m 0755 zentinel-auth-agent /usr/local/bin/
+```
+
+Other platforms need `cargo install --git` or a source build.
 
 ### From source
 
